@@ -327,6 +327,369 @@ Step 4 – Jenkins pipeline setup
 3. Manage Jenkins → Credentials → Add Docker Hub credentials with ID dockerhub-creds
 4. Click Build Now
 
+Q5 OPTIONAL 
+
+
+Yes — here is the **full experiment from the beginning**, in simple steps.
+
+This setup runs Jenkins in Docker, uses a Pipeline job to pull code from GitHub, build a Docker image, push it to Docker Hub, and deploy the app by starting a container. Jenkins has official Docker install docs, and Pipeline supports credentials and Docker workflows through plugins and Pipeline syntax. ([Jenkins][1])
+
+## Aim
+
+To configure a Jenkins pipeline that automatically builds and deploys a Dockerized application from a GitHub repository.
+
+---
+
+## Requirements
+
+You need:
+
+* Docker installed and running on your system
+* a GitHub repository containing your app
+* a Docker Hub account and repository
+* internet connection to pull Jenkins and plugins
+
+Jenkins provides an official Docker-based installation path, so you do not need a separate host Java installation just to start Jenkins this way. ([Jenkins][1])
+
+---
+
+## Step 1 — Start Jenkins in Docker
+
+First create a persistent volume:
+
+```bash
+docker volume create jenkins-data
+```
+
+Then run Jenkins:
+
+```bash
+docker run -d --name jenkins ^
+  -p 8080:8080 -p 50000:50000 ^
+  -v jenkins-data:/var/jenkins_home ^
+  -v /var/run/docker.sock:/var/run/docker.sock ^
+  jenkins/jenkins:lts
+```
+
+This starts Jenkins from the official `jenkins/jenkins:lts` image and mounts:
+
+* `/var/jenkins_home` for persistent Jenkins data
+* `/var/run/docker.sock` so Jenkins can talk to the host Docker daemon and build/run containers from jobs ([Jenkins][1])
+
+Get the initial admin password:
+
+```bash
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+```
+
+Open this in browser:
+
+```text
+http://localhost:8080
+```
+
+Paste the password and complete setup.
+
+---
+
+## Step 2 — Install Jenkins plugins
+
+After opening Jenkins:
+
+* choose **Install suggested plugins**
+* then go to **Manage Jenkins → Plugins**
+* install **Docker Pipeline**
+
+Pipeline jobs and Docker-based Pipeline usage rely on Jenkins Pipeline support and Docker-related plugin functionality. ([Jenkins][2])
+
+---
+
+## Step 3 — Install Docker CLI inside Jenkins container
+
+Jenkins can access the Docker daemon through the mounted socket, but the `docker` command-line tool must also exist inside the Jenkins container for shell steps like `docker build`, `docker login`, `docker push`, and `docker run`.
+
+Run:
+
+```bash
+docker exec -u root jenkins bash -c "apt-get update && apt-get install -y docker.io"
+```
+
+This works because the default Jenkins Docker image is Debian-based, and Debian package installation uses `apt-get`. Docker documents Debian installation through apt-based packages. ([Docker Documentation][3])
+
+You can verify:
+
+```bash
+docker exec jenkins docker --version
+```
+
+---
+
+## Step 4 — Prepare your GitHub repository
+
+Your GitHub repo should contain:
+
+* app source code
+* `Dockerfile`
+* `Jenkinsfile`
+
+Example structure:
+
+```text
+project/
+├── app.py
+├── requirements.txt
+├── Dockerfile
+└── Jenkinsfile
+```
+
+A Jenkins Pipeline can be defined in a `Jenkinsfile` stored in source control. Jenkins documents this as the standard Pipeline-as-code approach. ([Jenkins][4])
+
+---
+
+## Step 5 — Create Docker Hub credentials in Jenkins
+
+In Jenkins:
+
+* go to **Manage Jenkins → Credentials**
+* choose the appropriate store/domain
+* click **Add Credentials**
+* kind: **Username with password**
+* username: your Docker Hub username
+* password: your Docker Hub password or, better, a Docker Hub access token
+* ID: `dockerhub-creds`
+
+Jenkins credentials can be stored centrally and then referenced in Pipeline code by credential ID. ([Jenkins][5])
+
+---
+
+## Step 6 — Add `Jenkinsfile` in GitHub repo
+
+Put this file in the root of your repository.
+
+```groovy
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "python-app"
+        DOCKER_HUB_USER = "deyonagoshica"
+    }
+
+    stages {
+        stage('Clone') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/deyonagoshica/f.git'
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                sh 'docker build -t $DOCKER_HUB_USER/$IMAGE_NAME:latest .'
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        docker push $DOCKER_HUB_USER/$IMAGE_NAME:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    docker rm -f python-app-container || true
+                    docker run -d --name python-app-container -p 5001:5000 $DOCKER_HUB_USER/$IMAGE_NAME:latest
+                '''
+            }
+        }
+    }
+}
+```
+
+This Pipeline:
+
+* checks out the `main` branch from GitHub
+* builds the Docker image
+* uses Jenkins credentials for Docker Hub login
+* pushes the image
+* deploys it by running the image as a container
+
+Using `withCredentials` with a stored username/password credential is a documented Jenkins pattern. Jenkins also documents Docker-related Pipeline usage and credential handling. ([Jenkins][5])
+
+I changed deploy port to `5001:5000` to reduce the chance of conflict if port 5000 is already in use on your machine.
+
+---
+
+## Step 7 — Push the `Jenkinsfile` to GitHub
+
+In your project folder:
+
+```bash
+git add Jenkinsfile
+git commit -m "Add Jenkins pipeline"
+git push origin main
+```
+
+If your remote name is still `orgin`, use:
+
+```bash
+git push orgin main
+```
+
+---
+
+## Step 8 — Create Jenkins Pipeline job
+
+In Jenkins:
+
+* click **New Item**
+* enter name: `docker-python-pipeline`
+* choose **Pipeline**
+* click **OK**
+
+Then in the job configuration:
+
+* under **Pipeline**
+* choose **Pipeline script from SCM**
+* SCM: **Git**
+* Repository URL: `https://github.com/deyonagoshica/f.git`
+* Branch: `*/main`
+* Script Path: `Jenkinsfile`
+
+Save.
+
+Jenkins supports reading Pipeline definitions directly from SCM, including Git repositories. ([Jenkins][4])
+
+---
+
+## Step 9 — Run the pipeline
+
+Click **Build Now**.
+
+Jenkins will:
+
+1. clone the repo
+2. build the Docker image
+3. log in to Docker Hub
+4. push the image
+5. deploy the container
+
+---
+
+## Step 10 — Check the deployed app
+
+After success, open:
+
+```text
+http://localhost:5001
+```
+
+If your Flask app returns a message on `/`, you should see that output in the browser.
+
+You can also verify container status from terminal:
+
+```bash
+docker ps
+```
+
+And verify the image on Docker Hub by checking your repository there.
+
+---
+
+## Expected output
+
+Inside Jenkins stages, you should see:
+
+* **Clone** — success
+* **Build Image** — success
+* **Push to Docker Hub** — success
+* **Deploy** — success
+
+In browser:
+
+```text
+http://localhost:5001
+```
+
+In Docker Hub:
+
+```text
+deyonagoshica/python-app:latest
+```
+
+---
+
+## Most common errors
+
+### 1. `docker: command not found`
+
+Docker CLI was not installed inside Jenkins container.
+
+Fix:
+
+```bash
+docker exec -u root jenkins bash -c "apt-get update && apt-get install -y docker.io"
+```
+
+### 2. `permission denied /var/run/docker.sock`
+
+The Jenkins container can see the Docker socket, but there may be Docker daemon permission issues on the host/container setup. Mounting the socket is the standard way Jenkins-in-Docker talks to the host daemon, but host permissions still matter. ([Jenkins][1])
+
+### 3. Docker Hub login fails
+
+Check:
+
+* Docker Hub username
+* password/token
+* Jenkins credential ID is exactly `dockerhub-creds`
+
+### 4. Port already allocated
+
+Change deploy line to another port, like:
+
+```groovy
+docker run -d --name python-app-container -p 5002:5000 ...
+```
+
+### 5. Repo clone fails
+
+Make sure the GitHub repo URL and branch are correct.
+
+---
+
+## Viva answer
+
+You can say:
+
+> I ran Jenkins inside a Docker container and mounted the Docker socket so Jenkins could build and run Docker images. Then I installed the Docker CLI and configured a Pipeline job in Jenkins. I stored Docker Hub credentials in Jenkins Credentials and added a Jenkinsfile in the GitHub repository. When the pipeline runs, Jenkins clones the code from GitHub, builds the Docker image, pushes it to Docker Hub, and deploys the application by starting a container.
+
+If you want, I can turn this into a **record format** with **Aim, Tools Required, Steps, Jenkinsfile, Output, and Result**.
+
+[1]: https://www.jenkins.io/doc/book/installing/docker/?utm_source=chatgpt.com "Docker"
+[2]: https://www.jenkins.io/doc/book/pipeline/docker/?utm_source=chatgpt.com "Using Docker with Pipeline"
+[3]: https://docs.docker.com/engine/install/debian/?utm_source=chatgpt.com "Install Docker Engine on Debian"
+[4]: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/?utm_source=chatgpt.com "Using a Jenkinsfile"
+[5]: https://www.jenkins.io/doc/book/using/using-credentials/?utm_source=chatgpt.com "Using credentials"
+
+
+
+
+
+
+
+
+
+
 Q 06
 
 Use kubectl commands to create, scale, and manage Kubernetes resources like pods and deployments.
